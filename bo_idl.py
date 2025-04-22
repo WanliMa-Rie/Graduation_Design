@@ -171,14 +171,13 @@ def run_bo(Z_obs, Y_obs, bounds, n_iter, latent_size, model, tk, max_len, device
     for bo_step in tqdm(range(n_iter), desc="  BO Steps"):
         # Generate random candidate points in the latent space
         Z_candidates = np.random.uniform(lb, ub, size=(acquisition_samples, latent_size))
-
         # Predict objectives and variance for candidates using GPs
         Y_pred_mean = np.zeros((acquisition_samples, Y_obs.shape[1]))
         Y_pred_var = np.zeros((acquisition_samples, Y_obs.shape[1]))
         for i, gp in enumerate(gp_models):
             mean, var = gp.predict(Z_candidates)
             Y_pred_mean[:, i] = mean.flatten()
-            Y_pred_var[:, i] = var.flatten()
+            Y_pred_var[:, i] = var.flatten()\
             # Ensure variance is non-negative
             Y_pred_var[Y_pred_var < 1e-6] = 1e-6
 
