@@ -407,7 +407,7 @@ def optimize_molecules(args):
                           max_len, model_type='VAE').to(device)
     model.vocab = my_tokenizer.char_to_int # Crucial: Assign vocab to model for decoding
     try:
-        model.load_state_dict(torch.load(f'model/{args.model}_model_{args.cell_name}.pth', map_location=device))
+        model.load_state_dict(torch.load(f'model/{args.model}_model_{args.cell_name}.pth', map_location=device, weights_only=True))
     except FileNotFoundError:
         print(f"Error: Pre-trained model not found at model/{args.model}_model_{args.cell_name}.pth")
         print("Please train the VAE model first using --train_model.")
@@ -421,21 +421,21 @@ def optimize_molecules(args):
     # Get Initial Latent Vectors (e.g., from training data or random)
     print(f"Generating {args.bo_initial_points} initial latent points...")
     # Option 1: Encode subset of training data
-    # train_loader, _ = Gene_Dataloader(args.batch_size, args.path, args.cell_name, 1.0).get_dataloader() # Load all data
-    # Z_init_list = []
-    # with torch.no_grad():
-    #     count = 0
-    #     for batch in train_loader:
-    #         if count >= args.bo_initial_points:
-    #             break
-    #         batch = batch.to(device)
-    #         mu, _, _ = model.encode(batch) # Use mu as the representation
-    #         Z_init_list.append(mu.cpu().numpy())
-    #         count += batch.size(0)
-    # Z_init = np.concatenate(Z_init_list, axis=0)[:args.bo_initial_points]
+    train_loader, _ = Gene_Dataloader(args.batch_size, args.path, args.cell_name, 1.0).get_dataloader() # Load all data
+    Z_init_list = []
+    with torch.no_grad():
+        count = 0
+        for batch in train_loader:
+            if count >= args.bo_initial_points:
+                break
+            batch = batch.to(device)
+            mu, _, _ = model.encode(batch) # Use mu as the representation
+            Z_init_list.append(mu.cpu().numpy())
+            count += batch.size(0)
+    Z_init = np.concatenate(Z_init_list, axis=0)[:args.bo_initial_points]
 
     # Option 2: Sample from prior N(0, I)
-    Z_init = np.random.randn(args.bo_initial_points, args.latent_size)
+    # Z_init = np.random.randn(args.bo_initial_points, args.latent_size)
 
     print(f"Initial Z shape: {Z_init.shape}")
 
