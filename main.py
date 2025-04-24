@@ -37,9 +37,9 @@ parser.add_argument('--max_len', type=int, default=120, help="Maximum SMILES len
 parser.add_argument('--num_samples', type=int, default=1000, help="Number of samples for visualization/evaluation")
 
 # ----- BO-IDL specific parameters -----
-parser.add_argument('--bo_idl_iterations', type=int, default=50, help='Number of BO-IDL iterations')
-parser.add_argument('--bo_initial_points', type=int, default=1000, help='Number of initial points to evaluate before BO')
-parser.add_argument('--bo_points_per_iter', type=int, default=40, help='Number of points selected by BO in each iteration')
+parser.add_argument('--bo_idl_iterations', type=int, default=60, help='Number of BO-IDL iterations')
+parser.add_argument('--bo_initial_points', type=int, default=5000, help='Number of initial points to evaluate before BO')
+parser.add_argument('--bo_points_per_iter', type=int, default=20, help='Number of points selected by BO in each iteration')
 parser.add_argument('--bo_acquisition_samples', type=int, default=1000, help='Number of candidates sampled for acquisition function')
 parser.add_argument('--idl_epochs', type=int, default=100, help='Number of epochs for IDL update')
 parser.add_argument('--idl_lr', type=float, default=1e-4, help='Learning rate for IDL optimizer')

@@ -190,3 +190,28 @@ def latent_sample(args):
 
     for smile in sampled_smiles:
         print(smile)
+
+
+# Calculate candidates for exploration
+def generate_candidates_near(anchors, num_samples, latent_size, noise_std, lb=None, ub=None):
+    """
+    Generates candidate points by perturbing anchor points (e.g. Z_obs) for broader exploration.
+    """
+    num_anchors = anchors.shape[0]
+    candidates = []
+    indices = np.random.choice(num_anchors, size=num_samples,replace=True)
+    selected_anchors = anchors[indices]
+    noise = np.random.randn(num_samples, latent_size) * noise_std
+    candidates = selected_anchors + noise
+
+    if lb is not None and ub is not None:
+        candidates = np.clip(candidates, lb, ub)
+    
+    return candidates
+
+def generate_candidates_target(mu_target, std_target, num_samples, latent_size):
+    """
+    Generates candidates by sampling from the learned target Gaussian distribution.
+    """
+    std_target = np.maximum(std_target, 1e-6)
+    return mu_target + np.random.randn(num_samples, latent_size) * std_target
