@@ -15,7 +15,18 @@ SAS_AVAILABLE = True
 import GPy
 from utils import *
 from torch.nn.utils.rnn import pad_sequence
-
+import torch
+import numpy as np
+from tqdm import tqdm
+from botorch.models import SingleTaskGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.utils.multi_objective import is_non_dominated
+from botorch.utils.multi_objective.hypervolume import Hypervolume
+from botorch.acquisition.multi_objective import ExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective import qExpectedHypervolumeImprovement
+from botorch.models.model_list_gp_regression import ModelListGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from bo_idl import compute_targets, get_pareto_front
 from dataset import tokenizer, Gene_Dataloader
 from model import VAE_Autoencoder
 
@@ -126,19 +137,25 @@ def run_bo(
 
     print(f"Running Bayesian Optimization (Main Iteration: {main_iteration+1}/{total_iterations})...")
 
-    gp_models = []
-    print("  Training GP models...")
-    for i in range(Y_obs.shape[1]):
-        kernel = GPy.kern.RBF(input_dim=latent_size, variance=1.0, lengthscale=1.0)
-        Y_target_gp = Y_obs[:, i].reshape(-1, 1)
-        gp = GPy.models.GPRegression(Z_obs, Y_target_gp, kernel)
-        gp.optimize(messages=False, max_iters=200)
-        gp.optimize_restarts(num_restarts=3, verbose=False)
-        gp_models.append(gp)
+    Z_obs_tensor = torch.tensor(Z_obs, dtype=torch.float64, device=device)
+    Y_obs_tensor = torch.tensor(Y_obs, dtype=torch.float64, device=device)
+    bounds_tensor = torch.tensor(bounds, dtype=torch.float64, device=device).T
 
+    # 1. Train GP models using BoTorch
+    print("  Training GP models...")
+    gp_models = []
+    for i in range(Y_obs.shape[1]):
+        X = Z_obs_tensor
+        Y = Y_obs_tensor[:, i].unsqueeze(-1) # shape: (n,1)
+        model_gp = SingleTaskGP(X, Y, outcome_transform=None)
+        mll = ExactMarginalLogLikelihood(model_gp.likelihood, model_gp)
+        fit_gpytorch_mll(mll)
+        gp_models.append(model_gp)
+    model_list = ModelListGP(*gp_models)
+
+    # 2. Generate condidate points
     print("  Generating candidates...")
     lb, ub = bounds
-
     if main_iteration < total_iterations // 2:
         print(f"  Phase 1 (Exploration): Perturbing Z_obs (noise_std={noise_std_explore}).")
         Z_candidates = generate_candidates_near(
@@ -159,86 +176,80 @@ def run_bo(
         )
 
     print(f"  Generated {Z_candidates.shape[0]} candidates using {'Phase 1' if main_iteration < total_iterations // 2 else 'Phase 2'} strategy.")
+    Z_candidates_tensor = torch.tensor(Z_candidates, dtype=torch.float64, device=device)
 
-    print("  Predicting objectives for candidates...")
-    Y_pred_mean = np.zeros((acquisition_samples, Y_obs.shape[1]))
-    Y_pred_var = np.zeros((acquisition_samples, Y_obs.shape[1]))
-    for i, gp in enumerate(gp_models):
-            mean, var = gp.predict(Z_candidates)
-            Y_pred_mean[:, i] = mean.flatten()
-            Y_pred_var[:, i] = var.flatten()
-            Y_pred_var[Y_pred_var < 1e-6] = 1e-6
+    # 3. Compute EHVI acquisition function
+    print(f"Calculate EHVI acquisition function")
+    pareto_mask = is_non_dominated(Y_obs_tensor)
+    current_pareto_Y = Y_obs_tensor[pareto_mask].to(torch.float64)
+
+    ## Define reference point
+    ref_point = torch.tensor([-10.0, 0.0],dtype=torch.float64, device=device)
+
+    ## Initialize EHVI acquisition function
+    acquisition_function = qExpectedHypervolumeImprovement(
+        model=model_list,
+        ref_point=ref_point,
+        partitioning=None,
+        X_pending=Z_obs_tensor,
+        sampler=None
+    )
+
+    ## Evaluate EHVI for candidates
+    with torch.no_grad():
+        acq_values = acquisition_function(Z_candidates_tensor.unsqueeze(1))
+
+    # 4. Select top candidates
+    num_to_select = min(n_iter, len(acq_values))
+    _, best_indices = torch.topk(acq_values, k=num_to_select,largest=True)
+    best_indices = best_indices.cpu().numpy()
+    print(f"Selecting {len(best_indices)} points based on qEHVI scores")
 
 
-    print("  Calculating acquisition scores...")
-    acquisition_scores = []
-    pareto_idx_obs = get_pareto_front(Y_obs)
-    current_pareto_Y = Y_obs[pareto_idx_obs]
-
-    if current_pareto_Y.shape[0] == 0:
-        print("Warning: Current Pareto front is empty. Selecting based on predicted means.")
-        acquisition_scores = np.sum(Y_pred_mean, axis=1)
-    else:
-        for k in range(acquisition_samples):
-            y_pred_k = Y_pred_mean[k]
-            potential_Y = np.vstack([current_pareto_Y, y_pred_k])
-            potential_pareto_idx = get_pareto_front(potential_Y)
-            new_pareto_Y = potential_Y[potential_pareto_idx]
-
-            score = 0
-            if new_pareto_Y.shape[0] > 1:
-                 score = np.prod(np.max(new_pareto_Y, axis=0) - np.min(new_pareto_Y, axis=0))
-            elif new_pareto_Y.shape[0] == 1:
-                 score = np.prod(np.maximum(0, new_pareto_Y[0] - np.min(current_pareto_Y, axis=0))) if current_pareto_Y.shape[0] > 0 else np.prod(np.maximum(0, new_pareto_Y[0]))
-
-            acquisition_scores.append(score)
-    
-    acquisition_scores = np.array(acquisition_scores)
-
+    # 5. Evaluate selected candidates
     Z_new_list = []
     Y_new_list = []
     smiles_new_all_this_run = []
     smiles_new_valid_this_run = []
 
-    if acquisition_scores is not None and len(acquisition_scores) > 0 and acquisition_scores.ndim > 0:
-        num_to_select = min(n_iter, len(acquisition_scores))
-        best_indices = np.argsort(acquisition_scores)[-num_to_select:][::-1]
-    else:
-        print("Warning: No valid acquisition scores calculated or array is empty/0-dim, cannot select points.")
-        best_indices = []
-
-    print(f"  Selecting {len(best_indices)} points based on acquisition scores...")
-    for idx in tqdm(best_indices, desc="  BO Steps (Evaluating Selected)"):
+    for idx in tqdm(best_indices, desc='BO Steps (Evaluating Selected)'):
         z_next = Z_candidates[idx:idx+1]
-        y_next, smiles_next_all, smiles_next_valid, z_next_valid = compute_targets(z_next, model, tk, max_len, device)
-
+        y_next, smiles_next_all, smiles_next_valid, z_next_valid = compute_targets(
+            z_next, model, tk, max_len, device
+        )
         if len(smiles_next_valid) > 0:
             Z_new_list.extend(z_next_valid)
             Y_new_list.extend(y_next)
             smiles_new_all_this_run.extend(smiles_next_all)
             smiles_new_valid_this_run.extend(smiles_next_valid)
-        else:
-            pass
-
+    
     Z_new_array = np.array(Z_new_list)
     Y_new_array = np.array(Y_new_list)
 
+    # 6. Update observed data
     if Z_new_array.shape[0] > 0:
         updated_Z_obs = np.vstack([Z_obs, Z_new_array])
         updated_Y_obs = np.vstack([Y_obs, Y_new_array])
     else:
-        updated_Z_obs = Z_obs
-        updated_Y_obs = Y_obs
-        print("  No valid points added in this BO run.")
+        updated_Y_obs = Y_new_array
+        updated_Z_obs = Z_new_array
+        print("No valid points added in this BO run")
 
-    print("  Updating GP models with all new points for next iteration...")
-    for i, gp in enumerate(gp_models):
-        if Z_new_array.shape[0] > 0:
-            gp.set_XY(updated_Z_obs, updated_Y_obs[:, i].reshape(-1, 1))
-            gp.optimize(messages=False, max_iters=100)
-            gp.optimize_restarts(num_restarts=2, verbose=False, robust=True)
-        else:
-             print(f"  Skipping final GP Update for Objective {i+1} as no new valid points were added.")
+    # 7. Update GP models with new points
+    print(f"Update GP models with new valid points")
+    if Z_new_array.shape[0] > 0:
+        Z_obs_tensor = torch.tensor(updated_Z_obs, dtype=torch.float64, device=device)
+        Y_obs_tensor = torch.tensor(updated_Y_obs, dtype=torch.float64, device=device)
+        gp_models = []
+        for i in Y_obs_tensor.shape[1]:
+            X = Z_obs_tensor
+            Y = Y_obs_tensor[i]
+            model_gp = SingleTaskGP(X,Y,outcome_transform=None)
+            mll = ExactMarginalLogLikelihood(model_gp.likelihood, model_gp)
+            fit_gpytorch_mll(mll)
+            gp_models.append(model_gp)
+    else:
+        print("Skipping GP update for no valid points were added")
 
     return updated_Z_obs, updated_Y_obs, Z_new_array, Y_new_array, smiles_new_all_this_run, smiles_new_valid_this_run
 
