@@ -82,7 +82,7 @@ def compute_targets(z, model, tk, max_len, device):
     valid_z = []
 
     batch_size = z.shape[0]
-    z_tensor = torch.tensor(z, dtype=torch.float32, device=device)
+    z_tensor = torch.tensor(z, dtype=torch.float64, device=device)
 
     with torch.no_grad():
         logits = model.decode(z_tensor, max_len)  # (batch_size, max_len, vocab_size)
@@ -405,7 +405,6 @@ def optimize_molecules(args):
 
     # 3. Get Initial Latent Vectors
     print(f"Generating {args.bo_initial_points} initial latent points...")
-    ## Option 1: Encode subset of training data
     train_loader, _ = Gene_Dataloader(args.batch_size, args.path, args.cell_name, 1.0).get_dataloader()  # Load all data
     selected_samples_list = []
     for batch in train_loader:
@@ -425,18 +424,14 @@ def optimize_molecules(args):
     with torch.no_grad():
         mu, _, _ = model.encode(selected_samples_tensor)
         Z_init = mu.cpu().numpy()
-    
-    ## Option 2: Sample from prior N(0, I)
-    # Z_init = np.random.randn(args.bo_initial_points, args.latent_size)
 
     print(f"Initial Z shape: {Z_init.shape}")
 
-    # Compute initial objective values
+    # 4. Compute initial objective values
     print("Evaluating initial points...")
     Y_init, smiles_init_all, smiles_init_valid, Z_init_valid = compute_targets(Z_init, model, my_tokenizer, max_len, device)
     print(f"Initial evaluation complete. Found {len(smiles_init_valid)} valid molecules.")
 
-    # Use only valid points for the initial BO dataset
     Z_obs = Z_init_valid
     Y_obs = Y_init[np.all(Y_init != [-10.0, 0.0], axis=1)]
 
@@ -447,7 +442,7 @@ def optimize_molecules(args):
     print(f"Initial Z_obs shape: {Z_obs.shape}, Initial Y_obs shape: {Y_obs.shape}")
 
 
-    # Define latent space bounds (dynamic based on observed points)
+    # 5. Define latent space bounds
     lb = Z_obs.min(axis=0) - 1.0
     ub = Z_obs.max(axis=0) + 1.0
     bounds = (lb, ub)
@@ -466,9 +461,9 @@ def optimize_molecules(args):
         print(f"\n{'='*20} Iteration {iteration + 1}/{args.bo_idl_iterations} {'='*20}")
 
         # 1. Bayesian Optimization Step
-        Z_obs_before_bo = Z_obs
-        Y_obs_before_bo = Y_obs
-        iteration_added_before_bo = iteration_added
+        Z_obs_before_bo = Z_obs.copy()
+        Y_obs_before_bo = Y_obs.copy()
+        iteration_added_before_bo = iteration_added.copy()
 
         Z_obs, Y_obs, Z_new, Y_new, smiles_new_gen, smiles_new_val = run_bo(
             Z_obs, Y_obs, bounds,
