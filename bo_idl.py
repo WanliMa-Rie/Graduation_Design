@@ -12,7 +12,6 @@ import sys
 sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
 import sascorer #type: ignore
 SAS_AVAILABLE = True
-import GPy
 from utils import *
 from torch.nn.utils.rnn import pad_sequence
 import torch
@@ -24,9 +23,11 @@ from botorch.utils.multi_objective import is_non_dominated
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 from botorch.acquisition.multi_objective import ExpectedHypervolumeImprovement
 from botorch.acquisition.multi_objective import qExpectedHypervolumeImprovement
+from botorch.utils.multi_objective.box_decompositions import NondominatedPartitioning
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
 from botorch.models.model_list_gp_regression import ModelListGP
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from bo_idl import compute_targets, get_pareto_front
 from dataset import tokenizer, Gene_Dataloader
 from model import VAE_Autoencoder
 
@@ -142,22 +143,24 @@ def run_bo(
     bounds_tensor = torch.tensor(bounds, dtype=torch.float64, device=device).T
 
     # 1. Train GP models using BoTorch
-    print("  Training GP models...")
+    # print("  Training GP models...")
     gp_models = []
     for i in range(Y_obs.shape[1]):
         X = Z_obs_tensor
         Y = Y_obs_tensor[:, i].unsqueeze(-1) # shape: (n,1)
-        model_gp = SingleTaskGP(X, Y, outcome_transform=None)
+        model_gp = SingleTaskGP(X, Y,
+                                input_transform=Normalize(d=X.shape[-1]),
+                                outcome_transform=Standardize(m=1))
         mll = ExactMarginalLogLikelihood(model_gp.likelihood, model_gp)
         fit_gpytorch_mll(mll)
         gp_models.append(model_gp)
     model_list = ModelListGP(*gp_models)
 
     # 2. Generate condidate points
-    print("  Generating candidates...")
+    # print("  Generating candidates...")
     lb, ub = bounds
     if main_iteration < total_iterations // 2:
-        print(f"  Phase 1 (Exploration): Perturbing Z_obs (noise_std={noise_std_explore}).")
+        # print(f"  Phase 1 (Exploration): Perturbing Z_obs (noise_std={noise_std_explore}).")
         Z_candidates = generate_candidates_near(
             Z_obs,
             acquisition_samples,
@@ -167,7 +170,7 @@ def run_bo(
             ub=ub
         )
     else:
-        print("  Phase 2 (Exploitation): Sampling from target distribution.")
+        # print("  Phase 2 (Exploitation): Sampling from target distribution.")
         Z_candidates = generate_candidates_target(
             mu_target_np,
             std_target_np,
@@ -179,19 +182,22 @@ def run_bo(
     Z_candidates_tensor = torch.tensor(Z_candidates, dtype=torch.float64, device=device)
 
     # 3. Compute EHVI acquisition function
-    print(f"Calculate EHVI acquisition function")
+    # print(f"Calculating EHVI acquisition function ...")
     pareto_mask = is_non_dominated(Y_obs_tensor)
     current_pareto_Y = Y_obs_tensor[pareto_mask].to(torch.float64)
 
     ## Define reference point
     ref_point = torch.tensor([-10.0, 0.0],dtype=torch.float64, device=device)
 
+    ## Create partitioning for EHVI
+    partitioning = NondominatedPartitioning(ref_point, Y=current_pareto_Y)
+
     ## Initialize EHVI acquisition function
     acquisition_function = qExpectedHypervolumeImprovement(
         model=model_list,
         ref_point=ref_point,
-        partitioning=None,
-        X_pending=Z_obs_tensor,
+        partitioning=partitioning,
+        X_pending=None,
         sampler=None
     )
 
@@ -231,20 +237,22 @@ def run_bo(
         updated_Z_obs = np.vstack([Z_obs, Z_new_array])
         updated_Y_obs = np.vstack([Y_obs, Y_new_array])
     else:
-        updated_Y_obs = Y_new_array
-        updated_Z_obs = Z_new_array
+        updated_Y_obs = Y_obs
+        updated_Z_obs = Z_obs
         print("No valid points added in this BO run")
 
     # 7. Update GP models with new points
-    print(f"Update GP models with new valid points")
+    # print(f"Updating GP models with new valid points ...")
     if Z_new_array.shape[0] > 0:
         Z_obs_tensor = torch.tensor(updated_Z_obs, dtype=torch.float64, device=device)
         Y_obs_tensor = torch.tensor(updated_Y_obs, dtype=torch.float64, device=device)
         gp_models = []
-        for i in Y_obs_tensor.shape[1]:
+        for i in range(Y_obs_tensor.shape[1]):
             X = Z_obs_tensor
-            Y = Y_obs_tensor[i]
-            model_gp = SingleTaskGP(X,Y,outcome_transform=None)
+            Y = Y_obs_tensor[:, i].unsqueeze(-1)
+            model_gp = SingleTaskGP(X,Y,
+                                    input_transform=Normalize(d=X.shape[-1]),
+                                    outcome_transform=Standardize(m=1))
             mll = ExactMarginalLogLikelihood(model_gp.likelihood, model_gp)
             fit_gpytorch_mll(mll)
             gp_models.append(model_gp)
@@ -275,7 +283,7 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
         params of the fitted target Gaussian distribution.
     """
     mu_target_np, std_target_np = None, None
-    print("Running Iterative Distribution Learning (IDL)...")
+    # print("Running Iterative Distribution Learning (IDL)...")
     if len(smiles_elite) == 0:
         print("  No elite samples found, skipping IDL update.")
         return mu_target_np, std_target_np
@@ -366,10 +374,11 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
         avg_loss = epoch_loss / len(smiles_elite)
         avg_recon = epoch_recon_loss / len(smiles_elite)
         avg_kl = epoch_kl_loss / len(smiles_elite)
-        print(f"  IDL Epoch {epoch+1}/{idl_epochs}, Avg Loss: {avg_loss:.4f}, Avg Recon: {avg_recon:.4f}, Avg KL: {avg_kl:.4f}")
+        if (epoch+1) % 50 == 0:
+            print(f"  IDL Epoch {epoch+1}/{idl_epochs}, Avg Loss: {avg_loss:.4f}, Avg Recon: {avg_recon:.4f}, Avg KL: {avg_kl:.4f}")
 
     model.eval() 
-    print(f"  IDL finished. Returning target mu: {mu_target_np is not None}, std: {std_target_np is not None}")
+    # print(f"  IDL finished. Returning target mu: {mu_target_np is not None}, std: {std_target_np is not None}")
     return mu_target_np, std_target_np
 
 
@@ -380,13 +389,13 @@ def optimize_molecules(args):
     print("Starting Molecular Optimization...")
     print(f"Arguments: {args}")
 
-    # Initialization
+    # 1. Initialization
     my_tokenizer = tokenizer()
     vocab_size = my_tokenizer.vocab_size
     device = torch.device(args.device)
-    max_len = args.max_len # Use max_len from args for generation
+    max_len = args.max_len
 
-    # Load Pre-trained VAE Model
+    # 2. Load Pre-trained VAE Model
     print(f"Loading pre-trained VAE model from: model/{args.model}_model_{args.cell_name}.pth")
     model = VAE_Autoencoder(vocab_size, args.embedding_dim, args.hidden_size, args.latent_size, max_len, model_type='VAE').to(device)
     model.vocab = my_tokenizer.char_to_int 
@@ -394,35 +403,30 @@ def optimize_molecules(args):
     model.eval()
     print("Model loaded successfully.")
 
-    # Get Initial Latent Vectors
+    # 3. Get Initial Latent Vectors
     print(f"Generating {args.bo_initial_points} initial latent points...")
-    # Option 1: Encode subset of training data
+    ## Option 1: Encode subset of training data
     train_loader, _ = Gene_Dataloader(args.batch_size, args.path, args.cell_name, 1.0).get_dataloader()  # Load all data
     selected_samples_list = []
-    print("  Selecting initial samples from training data...")
-    # Iterate through the dataloader and collect raw samples first
     for batch in train_loader:
-        # Assuming each batch is a tensor or can be iterated over
         for sample in batch:
             if len(selected_samples_list) < args.bo_initial_points:
                 selected_samples_list.append(sample)
             else:
-                break # Stop collecting samples once we have enough
+                break
         if len(selected_samples_list) >= args.bo_initial_points:
-            break # Stop iterating through loader if we have enough samples
+            break 
 
-    print(f"  Collected {len(selected_samples_list)} initial samples.")
+    # print(f"  Collected {len(selected_samples_list)} initial samples.")
 
-    # Stack the collected raw samples into a single tensor
-    pad_idx = my_tokenizer.char_to_int.get(my_tokenizer.pad, 0) # Get pad index, default to 0 if not found
+    pad_idx = my_tokenizer.char_to_int.get(my_tokenizer.pad, 0)
     selected_samples_tensor = pad_sequence(selected_samples_list, batch_first=True, padding_value=pad_idx).to(device)
 
-    # Encode only the selected samples
-    print("  Encoding selected initial samples...")
     with torch.no_grad():
         mu, _, _ = model.encode(selected_samples_tensor)
         Z_init = mu.cpu().numpy()
-    # Option 2: Sample from prior N(0, I)
+    
+    ## Option 2: Sample from prior N(0, I)
     # Z_init = np.random.randn(args.bo_initial_points, args.latent_size)
 
     print(f"Initial Z shape: {Z_init.shape}")
@@ -487,7 +491,6 @@ def optimize_molecules(args):
             iteration_added = np.concatenate([iteration_added_before_bo, new_iterations])
 
         print(f"BO finished. Found {Z_new.shape[0]} new valid points. Total observed points: {Z_obs.shape[0]}")
-
         # Update bounds based on new observations
         lb = Z_obs.min(axis=0) - 1.0
         ub = Z_obs.max(axis=0) + 1.0
