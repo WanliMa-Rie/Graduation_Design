@@ -306,15 +306,15 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
             std_target_np = np.ones_like(mu_target_np) * 0.1
         else:
             mu_target_np, std_target_np = None, None
-        mu_target = torch.tensor(mu_target_np, dtype=torch.float32, device=device)
-        std_target = torch.tensor(std_target_np, dtype=torch.float32, device=device)
+        mu_target = torch.tensor(mu_target_np, dtype=torch.float64, device=device)
+        std_target = torch.tensor(std_target_np, dtype=torch.float64, device=device)
     else:
         mu_target_np = Z_elite.mean(axis=0)
         std_target_np = Z_elite.std(axis=0)
         
     if mu_target_np is not None and std_target_np is not None:
-        mu_target = torch.tensor(mu_target_np, dtype=torch.float32, device=device)
-        std_target = torch.tensor(std_target_np, dtype=torch.float32, device=device)
+        mu_target = torch.tensor(mu_target_np, dtype=torch.float64, device=device)
+        std_target = torch.tensor(std_target_np, dtype=torch.float64, device=device)
         target_dist = torch.distributions.Normal(mu_target, std_target)
     else:
         target_dist = None
@@ -377,8 +377,25 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
         if (epoch+1) % 50 == 0:
             print(f"  IDL Epoch {epoch+1}/{idl_epochs}, Avg Loss: {avg_loss:.4f}, Avg Recon: {avg_recon:.4f}, Avg KL: {avg_kl:.4f}")
 
+    print("Validating generation quality ...")
+    num_samples = 50
+    with torch.no_grad():
+        z_samples = target_dist.rsample((num_samples,)).to(device, dtype=torch.float64)
+        logits = model.decode(z_samples, max_len)
+        sampled_smiles = logits_to_smiles(logits, tk)
+
+        for i, smi in enumerate(sampled_smiles):
+            result = {'smiles': smi, 'SAS': 10.0, 'QED': 0.0, 'valid': False}
+            mol = Chem.MolFromSmiles(smi)
+            if mol:
+                sas = sascorer.calculateScore(mol)
+                qed = QED.qed(mol)
+                result['SAS'] = sas
+                result['QED'] = qed
+                result['valid'] = True
+                print(f"  Sample {i}: SMILES={smi}, SAS={result['SAS']:.4f}, QED={result['QED']:.4f}, Valid={result['valid']}")
+
     model.eval() 
-    # print(f"  IDL finished. Returning target mu: {mu_target_np is not None}, std: {std_target_np is not None}")
     return mu_target_np, std_target_np
 
 
@@ -400,6 +417,7 @@ def optimize_molecules(args):
     model = VAE_Autoencoder(vocab_size, args.embedding_dim, args.hidden_size, args.latent_size, max_len, model_type='VAE').to(device)
     model.vocab = my_tokenizer.char_to_int 
     model.load_state_dict(torch.load(f'model/{args.model}_model_{args.cell_name}.pth', map_location=device, weights_only=True))
+    model = model.double()
     model.eval()
     print("Model loaded successfully.")
 
@@ -492,35 +510,32 @@ def optimize_molecules(args):
         bounds = (lb, ub)
 
         # 2. Identify Elite Samples (Pareto Front)
-        pareto_idx = get_pareto_front(Y_obs)
-        Z_elite = Z_obs[pareto_idx]
-        Y_elite = Y_obs[pareto_idx]
+        Y_obs_tensor = torch.tensor(Y_obs, dtype=torch.float64, device=device)
+        pareto_mask = is_non_dominated(Y_obs_tensor)
 
-        # Regenerate SMILES for elite Z to ensure consistency
-        _, _, smiles_elite, _ = compute_targets(Z_elite, model, my_tokenizer, max_len, device)
-        valid_elite_indices = [i for i, smi in enumerate(smiles_elite) if Chem.MolFromSmiles(smi) is not None]
-        Z_elite = Z_elite[valid_elite_indices]
-        Y_elite = Y_elite[valid_elite_indices]
-        smiles_elite = [smiles_elite[i] for i in valid_elite_indices]
+        Z_elite = Z_obs[pareto_mask.cpu().numpy()]
+        Y_elite = Y_obs_tensor[pareto_mask].cpu().numpy()
+        smiles_elite = [all_smiles_valid[i] for i, is_pareto in enumerate(pareto_mask) if is_pareto]
 
         print(f"Identified {len(smiles_elite)} elite samples on the Pareto front.")
         if len(smiles_elite) > 0:
             print(f"Elite samples properties range:")
             print(f"  -SAS (Higher is better): min={np.min(Y_elite[:, 0]):.2f}, max={np.max(Y_elite[:, 0]):.2f}")
             print(f"   QED (Higher is better): min={np.min(Y_elite[:, 1]):.2f}, max={np.max(Y_elite[:, 1]):.2f}")
+            
+            ## Calculate Hypervolume
+            ref_points = torch.tensor([-10.0, 0.0], dtype=torch.float64, device=device)
+            hv = Hypervolume(ref_point=ref_points)
+            hypervolume = hv.compute(torch.tensor(Y_elite, dtype=torch.float64,device=device))
+            hypervolumes.append(hypervolume)
+            print(f"Hypervolume (ref=[-10, 0]): {hypervolume:.4f}")
+
             pareto_fronts_Y.append(Y_elite)
-            # Calculate Hypervolume (using simple range product as approximation)
-            if Y_elite.shape[0] > 0:
-                 ref_point = np.array([-10.0, 0.0]) # Fixed reference point
-                 hv_approx = np.prod(np.max(Y_elite, axis=0) - ref_point)
-            else:
-                 hv_approx = 0
-            hypervolumes.append(hv_approx)
-            print(f"Approximate Hypervolume (ref=[-10, 0]): {hv_approx:.4f}")
+        
         else:
             print("Warning: No valid elite samples found in this iteration.")
-            pareto_fronts_Y.append(np.empty((0,2))) # Add empty array
-            hypervolumes.append(hypervolumes[-1] if hypervolumes else 0) # Keep previous HV
+            hypervolumes.append(hypervolumes[-1] if hypervolumes else 0)
+            pareto_fronts_Y.append(np.empty((0, 2)))
 
 
         # 3. Iterative Distribution Learning (IDL) Step
@@ -533,8 +548,22 @@ def optimize_molecules(args):
              print("  Skipping IDL step as Z_elite is empty.")
              mu_target_for_bo, std_target_for_bo = None, None
 
-        # Optional: Save model checkpoint after each IDL update
-        # torch.save(model.state_dict(), f'model/{args.model}_model_{args.cell_name}_bo_idl_iter_{iteration+1}.pth')
+        
+
+
+    # --- Final Pareto Front and Hypervolume ---
+    Y_obs_tensor = torch.tensor(Y_obs, dtype=torch.float64, device=device)
+    final_pareto_mask = is_non_dominated(Y_obs_tensor)
+    final_pareto_Y = Y_obs_tensor[final_pareto_mask].cpu().numpy()
+    final_pareto_Z = Z_obs[final_pareto_mask.cpu().numpy()]
+    final_pareto_smiles = [all_smiles_valid[i] for i, is_pareto in enumerate(final_pareto_mask.cpu().numpy()) if is_pareto]
+
+    # Compute final hypervolume
+    ref_point = torch.tensor([-10.0, 0.0], dtype=torch.float64, device=device)
+    hv = Hypervolume(ref_point=ref_point)
+    final_hypervolume = hv.compute(torch.tensor(final_pareto_Y, dtype=torch.float64, device=device))
+    print(f"\nFinal Pareto front size: {len(final_pareto_Y)} points")
+    print(f"Final Hypervolume: {final_hypervolume:.4f}")
 
     # --- Save Results ---
     print("\nOptimization finished. Saving results...")
@@ -565,15 +594,10 @@ def optimize_molecules(args):
             f.write(f"{smi}\n")
 
     # Save final Pareto front
-    final_pareto_idx = get_pareto_front(Y_obs)
-    final_Z_pareto = Z_obs[final_pareto_idx]
-    final_Y_pareto = Y_obs[final_pareto_idx]
-    _, _, final_smiles_pareto, _ = compute_targets(final_Z_pareto, model, my_tokenizer, max_len, device)
-
-    np.save(os.path.join(results_dir, 'final_pareto_Z.npy'), final_Z_pareto)
-    np.save(os.path.join(results_dir, 'final_pareto_Y.npy'), final_Y_pareto)
+    np.save(os.path.join(results_dir, 'final_pareto_Z.npy'), final_pareto_Z)
+    np.save(os.path.join(results_dir, 'final_pareto_Y.npy'), final_pareto_Y)
     with open(os.path.join(results_dir, 'final_pareto_smiles.txt'), 'w') as f:
-        for smi, y in zip(final_smiles_pareto, final_Y_pareto):
+        for smi, y in zip(final_pareto_smiles, final_pareto_Y):
              mol = Chem.MolFromSmiles(smi)
              if mol:
                  f.write(f"{smi}\t{-y[0]:.4f}\t{y[1]:.4f}\n")
@@ -596,33 +620,26 @@ def optimize_molecules(args):
     plt.close()
 
     # Pareto front plot
+    # Pareto front plot
     plt.figure(figsize=(8, 8))
-    # Plot all observed points
-    # plt.scatter(Y_obs[:, 0], Y_obs[:, 1], c='gray', alpha=0.3, label='Observed Points')
     if Y_obs.shape[0] > 0 and iteration_added.shape[0] == Y_obs.shape[0]:
-        # Use a colormap (e.g., viridis, plasma, coolwarm)
-        cmap = plt.get_cmap('viridis', args.bo_idl_iterations + 1) # +1 for iteration 0
+        cmap = plt.get_cmap('viridis', args.bo_idl_iterations + 1)
         scatter_bg = plt.scatter(
             Y_obs[:, 0],
             Y_obs[:, 1],
-            c=iteration_added, # Color based on the iteration number
-            cmap=cmap,         # Apply the colormap
-            alpha=0.4,         # Make points slightly transparent
-            s=20,              # Adjust point size if needed
-            label='Observed Points (by Iteration)', # General label
-            vmin=0,            # Ensure colorbar starts at iteration 0
-            vmax=args.bo_idl_iterations # Ensure colorbar ends at the last iteration
+            c=iteration_added,
+            cmap=cmap,
+            alpha=0.4,
+            s=20,
+            label='Observed Points (by Iteration)',
+            vmin=0,
+            vmax=args.bo_idl_iterations
         )
-        # Add a colorbar
-        cbar = plt.colorbar(scatter_bg, label='Iteration Added')
-        # Optional: Set specific ticks on the colorbar if needed
-        # tick_locs = np.linspace(0, args.bo_idl_iterations, num=min(11, args.bo_idl_iterations + 1)) # Example: max 11 ticks
-        # cbar.set_ticks(tick_locs)
-        # cbar.set_ticklabels([f'{int(t)}' for t in tick_locs])
+        plt.colorbar(scatter_bg, label='Iteration Added')
     else:
         print("Warning: Cannot plot observed points by iteration due to data mismatch or empty data.")
-        # Fallback to gray scatter plot if iteration data is missing/mismatched
         plt.scatter(Y_obs[:, 0], Y_obs[:, 1], c='gray', alpha=0.3, s=20, label='Observed Points')
+
     # Plot initial Pareto front
     # init_pareto_idx = get_pareto_front(Y_init[np.all(Y_init != [-10.0, 0.0], axis=1)]) # Use only valid init points
     # init_Y_pareto = Y_init[np.all(Y_init != [-10.0, 0.0], axis=1)][init_pareto_idx]
@@ -640,35 +657,11 @@ def optimize_molecules(args):
     #                         edgecolor='black', linewidth=1, facecolor='orange', label=f'Initial Pareto ({init_Y_pareto.shape[0]})', zorder=3) # Ensure drawn on top
 
     # Plot final Pareto front
-    # if final_Y_pareto.shape[0] > 0:
-    #     plt.scatter(final_Y_pareto[:, 0], final_Y_pareto[:, 1], marker='*', s=150, edgecolor='k', facecolor='red', label=f'Final Pareto ({final_Y_pareto.shape[0]})')
-    #     # Sort for line plotting
-    #     final_Y_pareto_sorted = final_Y_pareto[np.argsort(final_Y_pareto[:, 0])]
-    #     plt.plot(final_Y_pareto_sorted[:, 0], final_Y_pareto_sorted[:, 1], 'r--', alpha=0.7)
-
-
-    # plt.xlabel('-SAS (Higher is Better)')
-    # plt.ylabel('QED (Higher is Better)')
-    # plt.title(f'Pareto Front Evolution ({args.cell_name})')
-    # plt.legend()
-    # plt.grid(True)
-    # plt.savefig(os.path.join(results_dir, 'pareto_front_final.png'))
-    # # plt.show()
-    # plt.close()
-
-    # print(f"Results saved in {results_dir}")
-
-    # if Y_obs.shape[0] > 0: # Ensure Y_obs is not empty before finding final pareto
-    #     final_pareto_idx = get_pareto_front(Y_obs)
-    #     final_Y_pareto = Y_obs[final_pareto_idx]
-    #     if final_Y_pareto.shape[0] > 0:
-    #         plt.scatter(final_Y_pareto[:, 0], final_Y_pareto[:, 1], marker='*', s=250, # Increased size
-    #                     edgecolor='black', linewidth=1, facecolor='red', label=f'Final Pareto ({final_Y_pareto.shape[0]})', zorder=4) # Ensure drawn on top
-    #         # Sort for line plotting
-    #         if final_Y_pareto.shape[0] > 1:
-    #              final_Y_pareto_sorted = final_Y_pareto[np.argsort(final_Y_pareto[:, 0])]
-    #              plt.plot(final_Y_pareto_sorted[:, 0], final_Y_pareto_sorted[:, 1], 'r--', alpha=0.7, linewidth=1.5, zorder=2)
-
+    if final_pareto_Y.shape[0] > 0:
+        plt.scatter(final_pareto_Y[:, 0], final_pareto_Y[:, 1], marker='*', s=150, edgecolor='k', facecolor='red', label=f'Final Pareto ({final_pareto_Y.shape[0]})')
+        if final_pareto_Y.shape[0] > 1:
+            final_pareto_sorted = final_pareto_Y[np.argsort(final_pareto_Y[:, 0])]
+            plt.plot(final_pareto_sorted[:, 0], final_pareto_sorted[:, 1], 'r--', alpha=0.7)
 
     plt.xlabel('-SAS (Higher is Better)')
     plt.ylabel('QED (Higher is Better)')
