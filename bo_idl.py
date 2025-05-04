@@ -264,7 +264,7 @@ def run_bo(
 
 # --- Iterative Distribution Learning (IDL) ---
 
-def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_epochs=5, idl_lr=1e-4, lambda_kl=0.01):
+def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_epochs=100, idl_lr=1e-4, lambda_kl=0.01):
     """
     Updates the VAE decoder using IDL based on elite samples.
 
@@ -327,6 +327,7 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
     elite_dataset = torch.utils.data.TensorDataset(X_elite_padded)
     # Use a small batch size for IDL update
     idl_batch_size = min(len(smiles_elite), 16)
+    print(f"idl batch size: {idl_batch_size}")
     elite_loader = torch.utils.data.DataLoader(elite_dataset, batch_size=idl_batch_size)
 
     # --- IDL Training Loop ---
@@ -393,7 +394,7 @@ def update_decoder_idl(model, Z_elite, smiles_elite, tk, max_len, device, idl_ep
                 result['SAS'] = sas
                 result['QED'] = qed
                 result['valid'] = True
-                print(f"  Sample {i}: SMILES={smi}, SAS={result['SAS']:.4f}, QED={result['QED']:.4f}, Valid={result['valid']}")
+                print(f"  Sample {i}: SMILES: {smi}, SAS={result['SAS']:.4f}, QED={result['QED']:.4f}, Valid={result['valid']}")
 
     model.eval() 
     return mu_target_np, std_target_np

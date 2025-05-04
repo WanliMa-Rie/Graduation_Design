@@ -18,14 +18,14 @@ parser.add_argument('--evaluation', action='store_true', help='Evaluation ASA an
 parser.add_argument('--latent_sample', action='store_true',help='Sample latent vector (from utils.py)')
 
 # ----- Model params settings -----
-parser.add_argument('--embedding_dim', type=int, default=128, help='The dimension of embedding')
-parser.add_argument('--hidden_size',type=int, default=256, help='The dimension of NN hidden layer')
+parser.add_argument('--embedding_dim', type=int, default=256, help='The dimension of embedding')
+parser.add_argument('--hidden_size',type=int, default=512, help='The dimension of NN hidden layer')
 parser.add_argument('--latent_size', type=int, default=64, help='The dimension of latent representation')
 parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate of Adam for VAE training')
-parser.add_argument('--num_epochs', type=int, default=80, help='Training epochs for VAE')
+parser.add_argument('--num_epochs', type=int, default=100, help='Training epochs for VAE')
 parser.add_argument('--batch_size', type=int, default=64, help='Training batch')
 parser.add_argument('--model', type=str, default='VAE', choices=['VAE', 'AE'], help='VAE or AE')
-parser.add_argument('--train_rate', type=float, default=0.8)
+parser.add_argument('--train_rate', type=float, default=1.0)
 parser.add_argument('--device', type=str, default='cpu', help="Device ('cpu', 'cuda', 'mps')")
 
 # ----- Data info -----

@@ -1,156 +1,208 @@
-import numpy as np
 import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
 from rdkit import Chem
-from rdkit.Chem import QED, DataStructs
-from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
-from rdkit.Contrib.SA_Score import sascorer # type: ignore
+from rdkit.Chem import QED, RDConfig, Draw
+from rdkit import RDLogger
+import os
+import sys
+import pickle
+sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
+import sascorer  # type: ignore
 from model import VAE_Autoencoder
-from dataset import tokenizer, Gene_Dataloader
-import argparse
+from dataset import tokenizer  # Assumes tokenizer has char_to_int and int_to_char
 
-# 球形插值函数
-def slerp(z1, z2, t):
-    z1_norm = z1 / torch.norm(z1)
-    z2_norm = z2 / torch.norm(z2)
-    dot = torch.dot(z1_norm, z2_norm).clamp(-1, 1)  # 避免数值误差
-    theta = torch.acos(dot)
-    sin_theta = torch.sin(theta)
-    if sin_theta < 1e-6:  # 当theta接近0时，使用线性插值
-        return (1 - t) * z1 + t * z2
-    return (torch.sin((1 - t) * theta) / sin_theta) * z1 + (torch.sin(t * theta) / sin_theta) * z2
+# Suppress RDKit warnings
+RDLogger.DisableLog('rdApp.*')
 
-# 插值并生成分子
-def interpolate_and_generate(model, z1, z2, num_steps=11, device='cpu'):
-    t_values = np.linspace(0, 1, num_steps)
-    linear_z = []
-    slerp_z = []
-    
-    for t in t_values:
-        z_linear = (1 - t) * z1 + t * z2
-        z_slerp = slerp(z1, z2, t)
-        linear_z.append(z_linear)
-        slerp_z.append(z_slerp)
-    
-    linear_z = torch.stack(linear_z).to(device)
-    slerp_z = torch.stack(slerp_z).to(device)
-    
-    with torch.no_grad():
-        linear_logits = model.decode(linear_z, model.max_len)
-        slerp_logits = model.decode(slerp_z, model.max_len)
-    
-    linear_smiles = indices_to_smiles(linear_logits.argmax(dim=-1).cpu().numpy(), model.int_to_char)
-    slerp_smiles = indices_to_smiles(slerp_logits.argmax(dim=-1).cpu().numpy(), model.int_to_char)
-    
-    return linear_smiles, slerp_smiles
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# SMILES转换函数（基于您的tokenizer）
-def indices_to_smiles(indices, int_to_char):
-    smiles_list = []
+# Model parameters
+Tokenizer = tokenizer()
+vocab_size = len(Tokenizer.char_to_int)
+embed_size = 128
+hidden_size = 256
+latent_size = 64
+max_len = 120
+model_type = 'VAE'
+model_path = 'results/bo_idl_zinc_64d/VAE_model_zinc_final_optimized.pth'
+
+# Load the model
+model = VAE_Autoencoder(vocab_size, embed_size, hidden_size, latent_size, max_len, model_type).to(device)
+model.load_state_dict(torch.load(model_path, map_location=device))
+model.eval()
+
+# Set the vocab for the model
+model.vocab = Tokenizer.char_to_int
+
+# Function to decode logits to SMILES
+def logits_to_smiles(logits, int_to_char):
+    indices = logits.argmax(dim=-1)  # (batch_size, seq_len)
+    batch_smiles = []
     for seq in indices:
-        chars = [int_to_char[i] for i in seq if i in int_to_char and int_to_char[i] not in ['^', '$', ' ']]
+        chars = []
+        for idx in seq:
+            char = int_to_char[idx.item()]
+            if char == '$':  # End token
+                break
+            if char != '^':  # Skip start token
+                chars.append(char)
         smiles = ''.join(chars)
-        smiles_list.append(smiles)
-    return smiles_list
+        batch_smiles.append(smiles)
+    return batch_smiles
 
-# 评估函数
-def evaluate_interpolation(smiles_list):
-    valid_smiles = [smi for smi in smiles_list if Chem.MolFromSmiles(smi) is not None]
-    validity = len(valid_smiles) / len(smiles_list) if smiles_list else 0.0
-    
-    if len(valid_smiles) < 2:
-        return validity, 0.0, 0.0, 0.0
-    
-    qed_values = [QED.qed(Chem.MolFromSmiles(smi)) for smi in valid_smiles]
-    sas_values = [sascorer.calculateScore(Chem.MolFromSmiles(smi)) for smi in valid_smiles]
-    
-    qed_diffs = [abs(qed_values[i] - qed_values[i-1]) for i in range(1, len(qed_values))]
-    sas_diffs = [abs(sas_values[i] - sas_values[i-1]) for i in range(1, len(sas_values))]
-    
-    fp_gen = GetMorganGenerator(radius=2)
-    fps = [fp_gen.GetFingerprint(Chem.MolFromSmiles(smi)) for smi in valid_smiles]
-    similarities = [DataStructs.TanimotoSimilarity(fps[i], fps[i-1]) for i in range(1, len(fps))]
-    
-    avg_qed_diff = np.mean(qed_diffs) if qed_diffs else 0.0
-    avg_sas_diff = np.mean(sas_diffs) if sas_diffs else 0.0
-    avg_similarity = np.mean(similarities) if similarities else 0.0
-    
-    return validity, avg_qed_diff, avg_sas_diff, avg_similarity
+# Function to validate SMILES
+def is_valid_smiles(smiles):
+    try:
+        mol = Chem.MolFromSmiles(smiles, sanitize=True)
+        return mol is not None
+    except:
+        return False
 
-# 主函数
-def main(args):
-    # 初始化tokenizer和模型
-    tk = tokenizer()
-    model = VAE_Autoencoder(
-        vocab_size=tk.vocab_size,
-        embed_size=args.embedding_dim,
-        hidden_size=args.hidden_size,
-        latent_size=args.latent_size,
-        max_len=args.max_len,
-        model_type='VAE'
-    ).to(args.device)
-    model.load_state_dict(torch.load(f'model/VAE_model_{args.cell_name}.pth', map_location=args.device))
-    model.eval()
-    model.vocab = tk.char_to_int
-    model.int_to_char = tk.int_to_char
+# Function to compute SAS and QED
+def compute_metrics(smiles):
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None, None
+        sas = sascorer.calculateScore(mol)
+        qed = QED.qed(mol)
+        return sas, qed
+    except:
+        return None, None
 
-    # 获取数据
-    train_loader, _ = Gene_Dataloader(args.batch_size, args.path, args.cell_name, 1.0).get_dataloader()
-    batch = next(iter(train_loader)).to(args.device)
-    
-    # 编码分子对
+# Spherical linear interpolation (slerp)
+def slerp(z1, z2, t):
+    omega = torch.acos(torch.dot(z1 / torch.norm(z1), z2 / torch.norm(z2)))
+    sin_omega = torch.sin(omega)
+    if sin_omega == 0:
+        return (1 - t) * z1 + t * z2  # Fallback to linear if parallel
+    return torch.sin((1 - t) * omega) / sin_omega * z1 + torch.sin(t * omega) / sin_omega * z2
+
+# Sample valid latent vectors
+def sample_valid_z(n_samples=1):
+    valid_z = []
+    while len(valid_z) < n_samples:
+        z = torch.randn(1, latent_size).to(device)  # Sample from standard normal
+        with torch.no_grad():
+            outputs = model.decode(z, max_len)  # (1, max_len, vocab_size)
+        smiles = logits_to_smiles(outputs, Tokenizer.int_to_char)[0]
+        if is_valid_smiles(smiles):
+            valid_z.append(z.squeeze(0))
+    return valid_z
+
+# Sample two valid latent vectors
+z1, z2 = sample_valid_z(2)
+z1, z2 = z1.to(device), z2.to(device)
+
+# Interpolate: 50 points + start and end (52 total)
+n_points = 150
+t = np.linspace(0, 1, n_points + 2)  # Includes start and end
+
+# Euclidean interpolation
+euclidean_z = []
+for ti in t:
+    z_t = (1 - ti) * z1 + ti * z2
+    euclidean_z.append(z_t)
+euclidean_z = torch.stack(euclidean_z)  # (52, latent_size)
+
+# Spherical interpolation
+spherical_z = []
+for ti in t:
+    z_t = slerp(z1, z2, torch.tensor(ti, device=device))
+    spherical_z.append(z_t)
+spherical_z = torch.stack(spherical_z)  # (52, latent_size)
+
+# Decode interpolated points and store molecular images
+def decode_and_evaluate(z_vectors, name):
+    valid_z = []
+    valid_smiles = []
+    sas_scores = []
+    qed_scores = []
+    mols = []
     with torch.no_grad():
-        mu, _, _ = model.encode(batch)
-        z1, z2 = mu[0], mu[1]  # 选择前两个分子
-    
-    # 插值并生成分子
-    linear_smiles, slerp_smiles = interpolate_and_generate(model, z1, z2, num_steps=11, device=args.device)
-    
-    # 评估插值结果
-    linear_validity, linear_qed_diff, linear_sas_diff, linear_sim = evaluate_interpolation(linear_smiles)
-    slerp_validity, slerp_qed_diff, slerp_sas_diff, slerp_sim = evaluate_interpolation(slerp_smiles)
-    
-    # 输出结果
-    print("=== Linear Interpolation Results ===")
-    print(f"Validity: {linear_validity:.4f}")
-    print(f"Avg QED Difference: {linear_qed_diff:.4f}")
-    print(f"Avg SAS Difference: {linear_sas_diff:.4f}")
-    print(f"Avg Tanimoto Similarity: {linear_sim:.4f}")
-    print("\nSMILES Sequence:")
-    for i, smi in enumerate(linear_smiles):
-        print(f"t={i/10:.1f}: {smi}")
-    
-    print("\n=== Spherical Interpolation Results ===")
-    print(f"Validity: {slerp_validity:.4f}")
-    print(f"Avg QED Difference: {slerp_qed_diff:.4f}")
-    print(f"Avg SAS Difference: {slerp_sas_diff:.4f}")
-    print(f"Avg Tanimoto Similarity: {slerp_sim:.4f}")
-    print("\nSMILES Sequence:")
-    for i, smi in enumerate(slerp_smiles):
-        print(f"t={i/10:.1f}: {smi}")
-    
-    # 判断潜空间几何
-    if (linear_validity > slerp_validity and 
-        linear_qed_diff < slerp_qed_diff and 
-        linear_sas_diff < slerp_sas_diff and 
-        linear_sim > slerp_sim):
-        print("\n结论：线性插值表现更优，潜空间更接近欧式空间。")
-    elif (slerp_validity > linear_validity and 
-          slerp_qed_diff < linear_qed_diff and 
-          slerp_sas_diff < linear_sas_diff and 
-          slerp_sim > linear_sim):
-        print("\n结论：球形插值表现更优，潜空间更接近球形空间。")
-    else:
-        print("\n结论：两种插值表现混合，需进一步分析潜空间结构。")
+        outputs = model.decode(z_vectors, max_len)  # (52, max_len, vocab_size)
+    smiles_list = logits_to_smiles(outputs, Tokenizer.int_to_char)
+    for i, smiles in enumerate(smiles_list):
+        if is_valid_smiles(smiles):
+            sas, qed = compute_metrics(smiles)
+            if sas is not None and qed is not None:
+                valid_z.append(z_vectors[i].cpu().numpy())
+                valid_smiles.append(smiles)
+                sas_scores.append(sas)
+                qed_scores.append(qed)
+                mol = Chem.MolFromSmiles(smiles)
+                mols.append(mol)
+    return np.array(valid_z), valid_smiles, sas_scores, qed_scores, mols
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--embedding_dim', type=int, default=128)
-    parser.add_argument('--hidden_size', type=int, default=256)
-    parser.add_argument('--latent_size', type=int, default=64)
-    parser.add_argument('--max_len', type=int, default=120)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--path', type=str, default='data/')
-    parser.add_argument('--cell_name', type=str, default='zinc')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    args = parser.parse_args()
-    main(args)
+# Process both interpolations
+euclidean_valid_z, euclidean_smiles, euclidean_sas, euclidean_qed, euclidean_mols = decode_and_evaluate(euclidean_z, "Euclidean")
+spherical_valid_z, spherical_smiles, spherical_sas, spherical_qed, spherical_mols = decode_and_evaluate(spherical_z, "Spherical")
+
+# Visualization of molecular structures
+def plot_molecules(mols, smiles_list, sas_scores, qed_scores, row, ax, cols, max_mols):
+    for i, (mol, smiles, sas, qed) in enumerate(zip(mols, smiles_list, sas_scores, qed_scores)):
+        if i >= max_mols:  # Limit to max_mols per row
+            break
+        if mol is None:
+            continue
+        col = i
+        img = Draw.MolToImage(mol, size=(200, 200))
+        ax[row, col].imshow(img)
+        ax[row, col].set_title(f"SAS: {sas:.2f}, QED: {qed:.2f}", fontsize=10)
+        ax[row, col].text(0.5, -0.1, smiles, ha='center', va='top', fontsize=8, wrap=True, transform=ax[row, col].transAxes)
+        ax[row, col].axis('off')
+
+# Create figure
+cols = 10  # Fixed number of columns
+rows = 2  # One row for Euclidean, one for Spherical
+fig, ax = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
+
+# Clear all axes
+for r in range(rows):
+    for c in range(cols):
+        ax[r, c].axis('off')
+
+# Plot Euclidean molecules (first row)
+if euclidean_mols:
+    plot_molecules(euclidean_mols, euclidean_smiles, euclidean_sas, euclidean_qed, 0, ax, cols, max_mols=cols)
+else:
+    ax[0, 0].text(0.5, 0.5, "Euclidean: No valid molecules", fontsize=12, ha='center', va='center')
+    ax[0, 0].axis('off')
+
+# Plot Spherical molecules (second row)
+if spherical_mols:
+    plot_molecules(spherical_mols, spherical_smiles, spherical_sas, spherical_qed, 1, ax, cols, max_mols=cols)
+else:
+    ax[1, 0].text(0.5, 0.5, "Spherical: No valid molecules", fontsize=12, ha='center', va='center')
+    ax[1, 0].axis('off')
+
+# Add row titles
+fig.suptitle("Euclidean Interpolation (Top Row), Spherical Interpolation (Bottom Row)", fontsize=14, y=1.05)
+
+plt.tight_layout()
+plt.savefig('interpolated_molecules.png', bbox_inches='tight')
+plt.close()
+
+# Save metrics
+metrics = {
+    'euclidean': {
+        'smiles': euclidean_smiles,
+        'sas': euclidean_sas,
+        'qed': euclidean_qed
+    },
+    'spherical': {
+        'smiles': spherical_smiles,
+        'sas': spherical_sas,
+        'qed': spherical_qed
+    }
+}
+with open('interpolation_metrics.pkl', 'wb') as f:
+    pickle.dump(metrics, f)
+
+print(f"Euclidean interpolation: {len(euclidean_smiles)} valid molecules")
+print(f"Spherical interpolation: {len(spherical_smiles)} valid molecules")
+print("Metrics saved to 'interpolation_metrics.pkl'")
+print("Plot saved to 'interpolated_molecules.png'")
