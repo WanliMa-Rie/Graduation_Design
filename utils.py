@@ -215,3 +215,19 @@ def generate_candidates_target(mu_target, std_target, num_samples, latent_size):
     """
     std_target = np.maximum(std_target, 1e-6)
     return mu_target + np.random.randn(num_samples, latent_size) * std_target
+
+
+
+
+# Decode initial SMILES
+def decode_smiles(model, dataset):
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda x: x[0])
+    model.eval()
+    cand_mols = []
+    with torch.no_grad():
+        for init_smiles in loader:
+            print(init_smiles)
+            final_smiles = model.decode(init_smiles)
+            mols = [(x,y) for x,y in zip(init_smiles, final_smiles)]
+            cand_mols.extend(mols)
+    return cand_mols
